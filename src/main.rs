@@ -1,15 +1,17 @@
-//! Yard v0.1 — the core loop only, per the plan doc's roadmap:
-//! `yard add`, `yard start` (timer + plan ratio), `yard spend`, `yard report`.
-//! No lockdown, no audio, no idle checks yet — those are v0.2+ by design.
+//! Yard v0.2 — the core loop plus REAL idle detection (plan doc section 7).
+//! `yard add/start/spend/read/report`. The cell still doesn't lock (v0.3+)
+//! and audio still doesn't play — small slices, shipping each one.
 
+mod idle;
 mod state;
 
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
+use idle::Action;
 use state::{Day, Session, Task, YardState};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(
@@ -33,7 +35,7 @@ enum Cmd {
         #[arg(long = "daily", value_parser = parse_duration_min)]
         daily: u64,
     },
-    /// Start a focus session. Answer honestly at the end; dishonesty costs.
+    /// Start a focus session. Idle > reading allowance pauses the timer.
     Start {
         /// Task name (must exist; see `yard add`).
         task: String,
@@ -41,6 +43,8 @@ enum Cmd {
         #[arg(long, default_value = "pomodoro")]
         plan: String,
     },
+    /// Tell Yard you're reading for N minutes: extra idle allowance next session.
+    Read { minutes: u64 },
     /// Spend earned yard time: `yard spend 30`.
     Spend { minutes: u64 },
     /// Today's report: focus vs goal, yard earned vs spent, streak.
@@ -74,11 +78,14 @@ struct Plan {
 }
 
 const PLANS: [Plan; 4] = [
-    Plan { name: "quick", focus_min: 1, rest_min: 1 }, // for trying the loop out
+    Plan { name: "quick", focus_min: 1, rest_min: 1 },
     Plan { name: "pomodoro", focus_min: 25, rest_min: 5 },
     Plan { name: "hour", focus_min: 60, rest_min: 15 },
     Plan { name: "deep", focus_min: 90, rest_min: 20 },
 ];
+
+/// Free idle seconds per session: 15% of its length (starter value, tune me).
+const IDLE_ALLOWANCE_PCT: u64 = 15;
 
 fn state_path(cli: &Cli) -> PathBuf {
     cli.state.clone().unwrap_or_else(|| {
@@ -122,6 +129,13 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
             println!("Task added: {name} ({daily} min/day)");
         }
         Cmd::Start { task, plan } => run_session(&mut st, task, plan)?,
+        Cmd::Read { minutes } => {
+            ensure!(*minutes > 0, "read for how many minutes?");
+            st.day.read_allowance_min += minutes; // consumed by the next session
+            println!(
+                "Noted: reading {minutes} min. That tops up your next session's idle allowance — reading is studying."
+            );
+        }
         Cmd::Spend { minutes } => {
             ensure!(*minutes > 0, "spend how many minutes?");
             let avail = st.day.yard_earned_min.saturating_sub(st.day.yard_spent_min);
@@ -148,33 +162,84 @@ fn run_session(st: &mut YardState, task_name: &str, plan_name: &str) -> Result<(
     let plan = PLANS
         .iter()
         .find(|p| p.name == plan_name)
-        .with_context(|| format!("unknown plan {plan_name:?} (try: pomodoro, hour, deep)"))?;
+        .with_context(|| format!("unknown plan {plan_name:?} (try: quick, pomodoro, hour, deep)"))?;
     let ratio = plan.rest_min as f64 / plan.focus_min as f64;
 
+    // Reading allowance topped up via `yard read` is one-shot per session.
+    let allowance_secs = plan.focus_min * 60 * IDLE_ALLOWANCE_PCT / 100
+        + st.day.read_allowance_min * 60;
+    let sensor_known = idle::idle_seconds().is_some();
+    if !sensor_known {
+        println!("v0.2 note: no idle sensor on this platform — falling back to the v0.1 honesty check.");
+    }
     println!(
-        "Plan {} : {} min focus, {} min rest. Task: {}",
+        "Plan {}: {} min focus, {} min rest. Task: {}",
         plan.name, plan.focus_min, plan.rest_min, task_name
     );
-    println!("v0.1 is an honest timer, not a lockdown (that's v0.2). Ctrl+C to bail.");
+    println!("Idle beyond the reading allowance pauses the timer. Ctrl+C to bail.");
 
-    let start = Instant::now();
-    let total_secs = plan.focus_min * 60;
-    while start.elapsed().as_secs() < total_secs {
-        let left = total_secs.saturating_sub(start.elapsed().as_secs());
-        print!("\r  {:>3}:{:02} left in the cell", left / 60, left % 60);
+    let target_secs = plan.focus_min * 60;
+    let mut gate = idle::IdleGate::new(allowance_secs);
+    // v0.2 admits only VERIFIED focus: second-ticks with real key/mouse input.
+    let mut focused_secs: u64 = 0;
+    let mut idle_paused_secs: u64 = 0;
+    let mut asked = false;
+
+    while focused_secs < target_secs {
+        let action = gate.tick(idle::idle_seconds());
+        match action {
+            Action::Count => {
+                focused_secs += 1;
+            }
+            Action::Allowance => { /* free idle: no credit, no nag */ }
+            Action::Ask { ticks_left } => {
+                if !asked {
+                    asked = true;
+                    println!("\nStill there? Move to keep the timer running ({} s)...", ticks_left);
+                }
+            }
+            Action::Paused => {
+                if !gate.is_paused() { unreachable!(); }
+                idle_paused_secs += 1;
+                if idle_paused_secs == 1 {
+                    println!("\nTimer PAUSED — away without answer for too long. No credit is accruing.");
+                }
+                // Wait out the pause (movement will flip the gate back).
+                std::thread::sleep(idle::sleep_secs());
+                continue;
+            }
+            Action::Resumed => {
+                if idle_paused_secs > 0 && gate.is_paused() { unreachable!(); }
+                if gate.is_paused() { unreachable!(); }
+                // Re-entered after pause/ask: credit the tick like Count does
+                // (the gate already reset the allowance).
+                focused_secs += 1;
+                if idle_paused_secs > 0 {
+                    println!("Resumed. Welcome back.");
+                    idle_paused_secs = 0;
+                    asked = false;
+                }
+            }
+        }
+        let left = target_secs.saturating_sub(focused_secs);
+        print!("\r  {:>2}:{:02} focused, in the cell", left / 60, left % 60);
         std::io::stdout().flush().ok();
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(idle::sleep_secs());
     }
-    println!("\nThe cell opens. Alive check:");
+    println!("\nThe cell opens.");
+    if !sensor_known {
+        // Honest fallback: no sensor ⇒ ask like v0.1 did.
+        print!("Focused the whole time? [Y/n]: ");
+        std::io::stdout().flush().ok();
+        let mut ans = String::new();
+        std::io::stdin().lock().read_line(&mut ans).ok();
+        if matches!(ans.trim().to_uppercase().as_str(), "N") {
+            focused_secs /= 2;
+        }
+    }
 
-    // v0.1 alive check is an honesty prompt; real idle detection is v0.2.
-    print!("Focused the whole time? [Y/n]: ");
-    std::io::stdout().flush().ok();
-    let mut ans = String::new();
-    std::io::stdin().lock().read_line(&mut ans).ok();
-    let honest = matches!(ans.trim(), "" | "y" | "Y" | "yes");
-    let focused_min = if honest { plan.focus_min } else { plan.focus_min / 2 };
-
+    let focused_min = focused_secs / 60;
+    let bailed = false; // idle never counts as a bail; strikes are for real misbehaviour (v0.3)
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -184,18 +249,21 @@ fn run_session(st: &mut YardState, task_name: &str, plan_name: &str) -> Result<(
             task: task_name.to_string(),
             started_at: ts,
             focused_min,
-            idle_min: 0,
-            bailed: !honest,
+            idle_min: idle_paused_secs / 60,
+            bailed,
         },
         ratio,
     );
     if let Some(t) = st.task_mut(task_name) {
         t.done_min += focused_min;
     }
-    let earned = st.day.yard_earned_min;
+    st.day.read_allowance_min = 0; // one-shot top-up consumed
+
     println!(
-        "Focused {focused_min} min. Yard earned today: {earned} min (clean streak: {}).",
-        st.day.clean_streak
+        "Focused {focused_min} min (paused {p} min). Yard earned today: {e} min (clean streak: {}).",
+        st.day.clean_streak,
+        p = idle_paused_secs / 60,
+        e = st.day.yard_earned_min
     );
     if let Some(t) = st.tasks.iter().find(|t| t.name == task_name) {
         println!("Task progress: {}/{} min today", t.done_min, t.daily_goal_min);
@@ -212,6 +280,9 @@ fn print_report(st: &YardState) {
         st.day.yard_earned_min - st.day.yard_spent_min
     );
     println!("  Clean streak: {} sessions", st.day.clean_streak);
+    if st.day.read_allowance_min > 0 {
+        println!("  Queued reading allowance: {} min (next session)", st.day.read_allowance_min);
+    }
     if st.tasks.is_empty() {
         println!("  No tasks yet — `yard add \"<name>\" --daily 2h`");
     }
@@ -223,10 +294,7 @@ fn print_report(st: &YardState) {
             .unwrap_or(0) as usize;
         let filled = pct.min(100) / 5;
         let bar = "#".repeat(filled) + &".".repeat(20 - filled);
-        println!(
-            "  {bar} {:>3}% {}/{} min",
-            pct, t.done_min, t.daily_goal_min
-        );
+        println!("  {bar} {:>3}% {}/{} min", pct, t.done_min, t.daily_goal_min);
     }
 }
 

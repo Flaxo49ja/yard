@@ -29,6 +29,8 @@ pub struct Day {
     pub yard_spent_min: u64,          // what was consumed by `yard spend`
     #[serde(default)]
     pub clean_streak: u64,            // consecutive clean sessions
+    #[serde(default)]
+    pub read_allowance_min: u64,      // queued by `yard read`, one-shot
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
