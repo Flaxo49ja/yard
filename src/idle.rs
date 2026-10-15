@@ -96,8 +96,9 @@ impl IdleGate {
         }
     }
 
-    pub fn is_paused(&self) -> bool {
-        self.gate == Gate::Paused
+    /// Seconds of free idle the allowance can still absorb (for the TUI gauge).
+    pub fn allowance_left(&self) -> u64 {
+        self.allowance_total.saturating_sub(self.allowance_used)
     }
 }
 
@@ -178,7 +179,6 @@ mod tests {
             assert!(matches!(g.tick(Some(7)), Ask { .. }));
         }
         assert_eq!(g.tick(Some(7)), Paused); // the 60th waiting second
-        assert!(g.is_paused());
         assert_eq!(g.tick(Some(9)), Paused); // silent idle stays paused
     }
 

@@ -1,15 +1,17 @@
-//! Yard v0.2 — the core loop plus REAL idle detection (plan doc section 7).
-//! `yard add/start/spend/read/report`. The cell still doesn't lock (v0.3+)
+//! Yard v0.3 — the core loop plus REAL idle detection (plan doc section 7)
+//! and a live session view (countdown + bar + allowance gauge + status).
+//! `yard add/start/spend/read/report`. The cell still doesn't lock (v0.4+)
 //! and audio still doesn't play — small slices, shipping each one.
 
 mod idle;
 mod state;
+mod ui;
 
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use idle::Action;
 use state::{Day, Session, Task, YardState};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -128,7 +130,7 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
             });
             println!("Task added: {name} ({daily} min/day)");
         }
-        Cmd::Start { task, plan } => run_session(&mut st, task, plan)?,
+        Cmd::Start { task, plan } => run_session(&mut st, path, task, plan)?,
         Cmd::Read { minutes } => {
             ensure!(*minutes > 0, "read for how many minutes?");
             st.day.read_allowance_min += minutes; // consumed by the next session
@@ -154,7 +156,7 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_session(st: &mut YardState, task_name: &str, plan_name: &str) -> Result<()> {
+fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str) -> Result<()> {
     ensure!(
         st.task_mut(task_name).is_some(),
         "unknown task {task_name:?} — `yard add` it first"
@@ -168,22 +170,41 @@ fn run_session(st: &mut YardState, task_name: &str, plan_name: &str) -> Result<(
     // Reading allowance topped up via `yard read` is one-shot per session.
     let allowance_secs = plan.focus_min * 60 * IDLE_ALLOWANCE_PCT / 100
         + st.day.read_allowance_min * 60;
-    let sensor_known = idle::idle_seconds().is_some();
-    if !sensor_known {
-        println!("v0.2 note: no idle sensor on this platform — falling back to the v0.1 honesty check.");
+
+    // Fancy frames only on a real terminal; piped/scripted runs get plain text.
+    let tty = std::io::stdout().is_terminal();
+    // Show how verified you are up front.
+    if !tty {
+        let sensor_known = idle::idle_seconds().is_some();
+        if !sensor_known {
+            println!("v0.2 note: no idle sensor on this platform — falling back to the v0.1 honesty check.");
+        }
+        println!(
+            "Plan {}: {} min focus, {} min rest. Task: {}",
+            plan.name, plan.focus_min, plan.rest_min, task_name
+        );
+        println!("Idle beyond the reading allowance pauses the timer. Ctrl+C to bail.");
     }
-    println!(
-        "Plan {}: {} min focus, {} min rest. Task: {}",
-        plan.name, plan.focus_min, plan.rest_min, task_name
-    );
-    println!("Idle beyond the reading allowance pauses the timer. Ctrl+C to bail.");
+
+    if tty {
+        // Hide the cursor while the frame paints, and guarantee the restore
+        // even when the process dies via Ctrl+C, panics, or errors.
+        print!("\x1b[?25l\x1b[2J");
+        std::io::stdout().flush().ok();
+        ctrlc::set_handler(|| {
+            print!("\x1b[?25h");
+            std::io::stdout().flush().ok();
+            std::process::exit(130);
+        })
+        .ok();
+    }
 
     let target_secs = plan.focus_min * 60;
     let mut gate = idle::IdleGate::new(allowance_secs);
     // v0.2 admits only VERIFIED focus: second-ticks with real key/mouse input.
     let mut focused_secs: u64 = 0;
     let mut idle_paused_secs: u64 = 0;
-    let mut asked = false;
+    let mut first_frame = true;
 
     while focused_secs < target_secs {
         let action = gate.tick(idle::idle_seconds());
@@ -192,43 +213,74 @@ fn run_session(st: &mut YardState, task_name: &str, plan_name: &str) -> Result<(
                 focused_secs += 1;
             }
             Action::Allowance => { /* free idle: no credit, no nag */ }
-            Action::Ask { ticks_left } => {
-                if !asked {
-                    asked = true;
-                    println!("\nStill there? Move to keep the timer running ({} s)...", ticks_left);
-                }
-            }
+            Action::Ask { .. } => { /* the frame says it all */ }
             Action::Paused => {
-                if !gate.is_paused() { unreachable!(); }
                 idle_paused_secs += 1;
-                if idle_paused_secs == 1 {
-                    println!("\nTimer PAUSED — away without answer for too long. No credit is accruing.");
-                }
-                // Wait out the pause (movement will flip the gate back).
-                std::thread::sleep(idle::sleep_secs());
-                continue;
             }
             Action::Resumed => {
-                if idle_paused_secs > 0 && gate.is_paused() { unreachable!(); }
-                if gate.is_paused() { unreachable!(); }
+                if idle_paused_secs > 0 {
+                    println!("\nResumed. Welcome back.");
+                    idle_paused_secs = 0;
+                }
                 // Re-entered after pause/ask: credit the tick like Count does
                 // (the gate already reset the allowance).
                 focused_secs += 1;
-                if idle_paused_secs > 0 {
-                    println!("Resumed. Welcome back.");
-                    idle_paused_secs = 0;
-                    asked = false;
-                }
             }
         }
-        let left = target_secs.saturating_sub(focused_secs);
-        print!("\r  {:>2}:{:02} focused, in the cell", left / 60, left % 60);
-        std::io::stdout().flush().ok();
+
+        let (status, accent) = match action {
+            Action::Count => (String::new(), Some("32")),
+            Action::Allowance => (
+                format!(
+                    "free reading time — {} of idle still absorbed",
+                    ui::mmss(gate.allowance_left())
+                ),
+                Some("33"),
+            ),
+            Action::Ask { ticks_left } => (
+                format!(
+                    "STILL THERE? move to keep counting — the timer stops for good in {ticks_left}s"
+                ),
+                Some("33"),
+            ),
+            Action::Paused => (
+                "PAUSED — no credit accruing. Move to resume.".to_string(),
+                Some("31"),
+            ),
+            Action::Resumed => ("welcome back — counting again".to_string(), Some("32")),
+        };
+
+        if tty {
+            let f = ui::Frame::focus(
+                task_name,
+                plan.name,
+                focused_secs,
+                target_secs,
+                allowance_secs,
+                gate.allowance_left(),
+                status,
+                accent,
+            );
+            draw_frame(&f, first_frame);
+            first_frame = false;
+        } else {
+            let left = target_secs.saturating_sub(focused_secs);
+            print!("\r  {:>2}:{:02} focused, in the cell", left / 60, left % 60);
+            std::io::stdout().flush().ok();
+        }
         std::thread::sleep(idle::sleep_secs());
     }
+
+    // Show the cursor again before any text prompt/read.
+    if tty {
+        print!("\x1b[?25h");
+        std::io::stdout().flush().ok();
+    }
     println!("\nThe cell opens.");
+    let sensor_known = idle::idle_seconds().is_some();
     if !sensor_known {
-        // Honest fallback: no sensor ⇒ ask like v0.1 did.
+        // Honest fallback — no sensor platform; asked on a terminal OR piped:
+        // v0.1's honesty check applies regardless of output mode.
         print!("Focused the whole time? [Y/n]: ");
         std::io::stdout().flush().ok();
         let mut ans = String::new();
@@ -239,7 +291,7 @@ fn run_session(st: &mut YardState, task_name: &str, plan_name: &str) -> Result<(
     }
 
     let focused_min = focused_secs / 60;
-    let bailed = false; // idle never counts as a bail; strikes are for real misbehaviour (v0.3)
+    let bailed = false; // idle never counts as a bail; strikes are for real misbehaviour (v0.4)
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -258,6 +310,9 @@ fn run_session(st: &mut YardState, task_name: &str, plan_name: &str) -> Result<(
         t.done_min += focused_min;
     }
     st.day.read_allowance_min = 0; // one-shot top-up consumed
+    // The yard-open countdown that follows is uninterruptible-by-sleep only;
+    // a Ctrl+C here must not lose the ledger, so persist before resting.
+    st.save(path).with_context(|| format!("writing {}", path.display()))?;
 
     println!(
         "Focused {focused_min} min (paused {p} min). Yard earned today: {e} min (clean streak: {}).",
@@ -268,7 +323,58 @@ fn run_session(st: &mut YardState, task_name: &str, plan_name: &str) -> Result<(
     if let Some(t) = st.tasks.iter().find(|t| t.name == task_name) {
         println!("Task progress: {}/{} min today", t.done_min, t.daily_goal_min);
     }
+
+    // The rest phase (plan doc section 4): the yard is open. This is your
+    // reward break; the focus credit is already banked and safe.
+    let rest_secs = plan.rest_min * 60;
+    if rest_secs > 0 {
+        if tty {
+            println!("\n  Yard time — stretch, look far away, refill the cup.\n");
+            std::io::stdout().flush().ok();
+            print!("\x1b[?25l");
+            std::io::stdout().flush().ok();
+            first_frame = true;
+            let mut rest_done = 0u64;
+            while rest_done < rest_secs {
+                // Rest view: countdown + bar + already-banked reassurance.
+                let f = ui::Frame::rest(
+                    task_name,
+                    plan.name,
+                    rest_done,
+                    rest_secs,
+                    "the yard is open — break freely".to_string(),
+                    Some("36"),
+                );
+                draw_frame(&f, first_frame);
+                first_frame = false;
+                rest_done += 1;
+                // One-second fine-grained countdown keeps the bar honest.
+                std::thread::sleep(idle::sleep_secs());
+            }
+            println!("\nThe yard closes. Ready for the next cell? `yard start <task>`.\n");
+            print!("\x1b[?25h");
+            std::io::stdout().flush().ok();
+        } else {
+            println!(
+                "Rest: {} min — the yard is open. Come back for the next cell: `yard start <task>`.",
+                plan.rest_min
+            );
+        }
+    }
     Ok(())
+}
+
+/// Repaint the terminal from the top with the frame (and clean up below it).
+/// `full_clear` wipes the whole screen once — the rest/focus transition wants
+/// a clean slate; every later tick overwrites only its own frame region.
+fn draw_frame(f: &ui::Frame, full_clear: bool) {
+    let text = if full_clear {
+        "\x1b[2J\x1b[H".to_string() + &ui::render(f)
+    } else {
+        "\x1b[H".to_string() + &ui::render(f)
+    };
+    print!("{text}\x1b[J");
+    std::io::stdout().flush().ok();
 }
 
 fn print_report(st: &YardState) {
