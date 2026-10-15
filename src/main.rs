@@ -1,9 +1,11 @@
-//! Yard v0.3 — the core loop plus REAL idle detection (plan doc section 7)
-//! and a live session view (countdown + bar + allowance gauge + status).
-//! `yard add/start/spend/read/report`. The cell still doesn't lock (v0.4+)
+//! Yard v0.4 — core loop, REAL idle detection (plan doc section 7), and the
+//! full session view: boxed countdown frame with projected-yard reward,
+//! plus raw-mode keys ([P] pause, [R] reading, [X] emergency exit that
+//! banks partial credit as a bail). The cell still doesn't lock (v0.5+)
 //! and audio still doesn't play — small slices, shipping each one.
 
 mod idle;
+mod keys;
 mod state;
 mod ui;
 
@@ -85,6 +87,16 @@ const PLANS: [Plan; 4] = [
     Plan { name: "hour", focus_min: 60, rest_min: 15 },
     Plan { name: "deep", focus_min: 90, rest_min: 20 },
 ];
+
+/// Friendly plan name for the frame (plan ids stay stable for `--plan`).
+fn plan_label(id: &str) -> &'static str {
+    match id {
+        "quick" => "Warmup",
+        "hour" => "Hour",
+        "deep" => "Deep Work",
+        _ => "Pomodoro",
+    }
+}
 
 /// Free idle seconds per session: 15% of its length (starter value, tune me).
 const IDLE_ALLOWANCE_PCT: u64 = 15;
@@ -193,6 +205,7 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
         std::io::stdout().flush().ok();
         ctrlc::set_handler(|| {
             print!("\x1b[?25h");
+            keys::restore(); // raw mode must not outlive the process
             std::io::stdout().flush().ok();
             std::process::exit(130);
         })
@@ -205,9 +218,54 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
     let mut focused_secs: u64 = 0;
     let mut idle_paused_secs: u64 = 0;
     let mut first_frame = true;
+    let mut manual_pause = false;
+    let mut bail_now = false; // [X] emergency exit
+    let mut tick: u64 = 0; // drives the tip rotation
+    let mut notice = String::new(); // transient status (e.g. after [R])
+    let mut notice_ticks = 0u8;
+    let clean_streak = st.day.clean_streak; // multiplier context for projection
+    let label = plan_label(plan.name);
+    // Raw keys are a real-terminal privilege; without them the honest prose
+    // hints stay up and Ctrl+C remains the only way out.
+    let raw_keys = if tty { keys::RawKeys::enable() } else { None };
+    let keys_available = raw_keys.is_some();
 
     while focused_secs < target_secs {
-        let action = gate.tick(idle::idle_seconds());
+        tick += 1;
+
+        // Keys first: poll every second (raw mode, nonblocking).
+        if let Some(rk) = &raw_keys {
+            match rk.try_read() {
+                Some(c) if c == keys::KEY_PAUSE => {
+                    if manual_pause {
+                        // Resuming a deliberate break forgives the gate so
+                        // the idle allowance isn't burnt by the break.
+                        gate.forgive_idle();
+                        manual_pause = false;
+                    } else {
+                        manual_pause = true;
+                    }
+                }
+                Some(c) if c == keys::KEY_READ => {
+                    gate.grant_allowance(60);
+                    notice = "Reading +1:00 — free idle extended (reading is studying)".to_string();
+                    notice_ticks = 4;
+                }
+                Some(c) if c == keys::KEY_EXIT => {
+                    bail_now = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // A deliberate pause [P] stops the whole clock: the gate is frozen
+        // (nothing accrues, nothing burns) and resumes forgiven.
+        let action = if manual_pause {
+            idle::Action::Paused
+        } else {
+            gate.tick(idle::idle_seconds())
+        };
         match action {
             Action::Count => {
                 focused_secs += 1;
@@ -228,36 +286,50 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
             }
         }
 
-        let (status, accent) = match action {
-            Action::Count => (String::new(), Some("32")),
-            Action::Allowance => (
-                format!(
-                    "free reading time — {} of idle still absorbed",
-                    ui::mmss(gate.allowance_left())
-                ),
+        let (status, accent) = if manual_pause {
+            (
+                "PAUSED BY YOU — the clock is stopped, no credit accrues. [P] to resume".to_string(),
                 Some("33"),
-            ),
-            Action::Ask { ticks_left } => (
-                format!(
-                    "STILL THERE? move to keep counting — the timer stops for good in {ticks_left}s"
+            )
+        } else if notice_ticks > 0 {
+            (notice.clone(), Some("36"))
+        } else {
+            match action {
+                Action::Count => (String::new(), Some("32")),
+                Action::Allowance => (
+                    format!(
+                        "free reading time — {} of idle still absorbed",
+                        ui::mmss(gate.allowance_left())
+                    ),
+                    Some("33"),
                 ),
-                Some("33"),
-            ),
-            Action::Paused => (
-                "PAUSED — no credit accruing. Move to resume.".to_string(),
-                Some("31"),
-            ),
-            Action::Resumed => ("welcome back — counting again".to_string(), Some("32")),
+                Action::Ask { ticks_left } => (
+                    format!(
+                        "STILL THERE? move to keep counting — the timer stops for good in {ticks_left}s"
+                    ),
+                    Some("33"),
+                ),
+                Action::Paused => (
+                    "PAUSED — no credit accruing. Move to resume".to_string(),
+                    Some("31"),
+                ),
+                Action::Resumed => ("welcome back — counting again".to_string(), Some("32")),
+            }
         };
+        notice_ticks = notice_ticks.saturating_sub(1);
 
         if tty {
             let f = ui::Frame::focus(
                 task_name,
-                plan.name,
+                label,
                 focused_secs,
                 target_secs,
+                ratio,
+                clean_streak,
                 allowance_secs,
                 gate.allowance_left(),
+                ui::TIPS[((tick / 60) as usize) % ui::TIPS.len()],
+                keys_available,
                 status,
                 accent,
             );
@@ -276,11 +348,13 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
         print!("\x1b[?25h");
         std::io::stdout().flush().ok();
     }
+    keys::restore(); // Drop would handle it; restore early is idempotent
     println!("\nThe cell opens.");
+    let bailed = bail_now; // [X] banks partial credit AS A BAIL (streak resets)
     let sensor_known = idle::idle_seconds().is_some();
-    if !sensor_known {
-        // Honest fallback — no sensor platform; asked on a terminal OR piped:
-        // v0.1's honesty check applies regardless of output mode.
+    if !sensor_known && !bailed {
+        // Honest fallback — no sensor platform; asked on a terminal OR piped.
+        // (A bail already carries its own penalty; double-asking is not honest.)
         print!("Focused the whole time? [Y/n]: ");
         std::io::stdout().flush().ok();
         let mut ans = String::new();
@@ -291,7 +365,6 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
     }
 
     let focused_min = focused_secs / 60;
-    let bailed = false; // idle never counts as a bail; strikes are for real misbehaviour (v0.4)
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -320,29 +393,48 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
         p = idle_paused_secs / 60,
         e = st.day.yard_earned_min
     );
+    if bailed {
+        println!("Emergency exit: this banks as a bail — the clean streak reset, but the work wasn't wasted.");
+    }
     if let Some(t) = st.tasks.iter().find(|t| t.name == task_name) {
         println!("Task progress: {}/{} min today", t.done_min, t.daily_goal_min);
     }
 
     // The rest phase (plan doc section 4): the yard is open. This is your
-    // reward break; the focus credit is already banked and safe.
+    // reward break; the focus credit is already banked and safe. A bail
+    // earns no rest — that's what makes the streak worth keeping.
     let rest_secs = plan.rest_min * 60;
-    if rest_secs > 0 {
+    if rest_secs > 0 && !bailed {
         if tty {
             println!("\n  Yard time — stretch, look far away, refill the cup.\n");
             std::io::stdout().flush().ok();
             print!("\x1b[?25l");
             std::io::stdout().flush().ok();
+            let raw_rest = keys::RawKeys::enable();
+            let banked = st
+                .tasks
+                .iter()
+                .find(|t| t.name == task_name)
+                .map_or(0, |t| t.done_min * 60);
             first_frame = true;
             let mut rest_done = 0u64;
+            let mut back_early = false;
             while rest_done < rest_secs {
                 // Rest view: countdown + bar + already-banked reassurance.
+                if let Some(rk) = &raw_rest {
+                    if matches!(rk.try_read(), Some(c) if c == keys::KEY_EXIT) {
+                        back_early = true;
+                        break;
+                    }
+                }
                 let f = ui::Frame::rest(
                     task_name,
-                    plan.name,
+                    label,
                     rest_done,
                     rest_secs,
-                    "the yard is open — break freely".to_string(),
+                    banked,
+                    raw_rest.is_some(),
+                    String::new(),
                     Some("36"),
                 );
                 draw_frame(&f, first_frame);
@@ -351,10 +443,15 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
                 // One-second fine-grained countdown keeps the bar honest.
                 std::thread::sleep(idle::sleep_secs());
             }
-            println!("\nThe yard closes. Ready for the next cell? `yard start <task>`.\n");
+            if back_early {
+                println!("\nThe yard closed early — back in the cell when you are. `yard start <task>`.\n");
+            } else {
+                println!("\nThe yard closes. Ready for the next cell? `yard start <task>`.\n");
+            }
             print!("\x1b[?25h");
+            keys::restore();
             std::io::stdout().flush().ok();
-        } else {
+        } else if !bailed {
             println!(
                 "Rest: {} min — the yard is open. Come back for the next cell: `yard start <task>`.",
                 plan.rest_min

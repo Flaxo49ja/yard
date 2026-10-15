@@ -100,6 +100,22 @@ impl IdleGate {
     pub fn allowance_left(&self) -> u64 {
         self.allowance_total.saturating_sub(self.allowance_used)
     }
+
+    /// [R] Reading mid-session: add free idle seconds (reading is studying).
+    /// Pressing a key is human activity, so an active "Still there?" state
+    /// resolves back to Watching with the extended budget.
+    pub fn grant_allowance(&mut self, secs: u64) {
+        self.allowance_total += secs;
+        self.gate = Gate::Watching;
+    }
+
+    /// Back from a deliberate pause ([P]): don't punish the break — the
+    /// allowance is untouched and any half-started "Still there?" question
+    /// is dropped, back to Watching.
+    pub fn forgive_idle(&mut self) {
+        self.allowance_used = 0;
+        self.gate = Gate::Watching;
+    }
 }
 
 /// Alderwood-style platform idle sensor. Returns None when no sensor exists.
@@ -202,6 +218,30 @@ mod tests {
         assert_eq!(g.tick(Some(0)), Resumed);  // answered by coming back
         // full allowance available again after the reset
         assert_eq!(g.tick(Some(8)), Allowance);
+    }
+
+    #[test]
+    fn granting_allowance_extends_the_free_idle_budget() {
+        let mut g = gate(0);
+        assert!(matches!(g.tick(Some(9)), Ask { .. })); // no allowance at all
+        g.grant_allowance(2);
+        assert_eq!(g.allowance_left(), 2);
+        // two ticks absorbed by the new allowance, then it asks again
+        assert_eq!(g.tick(Some(8)), Allowance);
+        assert_eq!(g.tick(Some(8)), Allowance);
+        assert!(matches!(g.tick(Some(8)), Ask { .. }));
+    }
+
+    #[test]
+    fn forgiveness_after_manual_pause_restores_full_allowance_and_watch() {
+        let mut g = gate(5);
+        for _ in 0..5 {
+            assert_eq!(g.tick(Some(9)), Allowance);
+        }
+        g.tick(Some(9)); // into Asking
+        g.forgive_idle();
+        assert_eq!(g.allowance_left(), 5); // full budget again
+        assert_eq!(g.tick(Some(9)), Allowance); // Watching, not Asking
     }
 
     #[test]
