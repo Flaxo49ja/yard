@@ -1,11 +1,12 @@
-//! Yard v0.4 — core loop, REAL idle detection (plan doc section 7), and the
-//! full session view: boxed countdown frame with projected-yard reward,
-//! plus raw-mode keys ([P] pause, [R] reading, [X] emergency exit that
-//! banks partial credit as a bail). The cell still doesn't lock (v0.5+)
-//! and audio still doesn't play — small slices, shipping each one.
+//! Yard v0.5 — core loop, REAL idle detection, the full session frame with
+//! raw-mode keys ([P] pause, [R] reading, [X] emergency exit that banks
+//! partial credit as a bail), AND the lockdown watcher (plan doc section 6):
+//! process + window watching that calls out offenders — DRY RUN by default,
+//! `--lock enforce` arms the kill. Audio still doesn't play — one slice each.
 
 mod idle;
 mod keys;
+mod lock;
 mod state;
 mod ui;
 
@@ -40,18 +41,23 @@ enum Cmd {
         daily: u64,
     },
     /// Start a focus session. Idle > reading allowance pauses the timer.
+    /// `--lock dry` (default when the flag is set) only FLAGS offenders;
+    /// `--lock enforce` additionally closes them. Never locks you out.
     Start {
         /// Task name (must exist; see `yard add`).
         task: String,
         /// Plan preset: quick (1 min, for testing), pomodoro 25/5, hour 60/15, deep 90/20.
         #[arg(long, default_value = "pomodoro")]
         plan: String,
+        /// Lockdown mode: "dry" (flag only) or "enforce" (flag + close).
+        #[arg(long = "lock")]
+        lock: Option<String>,
     },
     /// Tell Yard you're reading for N minutes: extra idle allowance next session.
     Read { minutes: u64 },
     /// Spend earned yard time: `yard spend 30`.
     Spend { minutes: u64 },
-    /// Today's report: focus vs goal, yard earned vs spent, streak.
+    /// Today's report: focus vs goal, yard earned vs spent, streak, strikes.
     Report {},
 }
 
@@ -59,15 +65,14 @@ enum Cmd {
 fn parse_duration_min(s: &str) -> Result<u64, String> {
     let s = s.trim().to_lowercase();
     let (hours, mins) = if let Some((h, m)) = s.split_once('h') {
-        (
-            h.trim(),
-            m.trim().trim_end_matches('m').trim(),
-        )
+        (h.trim(), m.trim().trim_end_matches('m').trim())
     } else {
-        ("0", s.trim_end_matches('m').trim())
+        ("0", s.trim().trim_end_matches('m').trim())
     };
-    let hours: u64 = if hours.is_empty() { 0 } else { hours.parse().map_err(|_| format!("bad duration: {s}"))? };
-    let mins: u64 = if mins.is_empty() { 0 } else { mins.parse().map_err(|_| format!("bad duration: {s}"))? };
+    let hours: u64 =
+        if hours.is_empty() { 0 } else { hours.parse().map_err(|_| format!("bad duration: {s}"))? };
+    let mins: u64 =
+        if mins.is_empty() { 0 } else { mins.parse().map_err(|_| format!("bad duration: {s}"))? };
     let total = hours * 60 + mins;
     if total == 0 {
         return Err(format!("duration must be more than zero: {s}"));
@@ -100,6 +105,10 @@ fn plan_label(id: &str) -> &'static str {
 
 /// Free idle seconds per session: 15% of its length (starter value, tune me).
 const IDLE_ALLOWANCE_PCT: u64 = 15;
+
+/// Lockdown cadence: one scan per this many ticks (1s each), tune me.
+const LOCK_SCAN_EVERY: u64 = 5;
+const LOCK_SHOW_TICKS: u16 = 12; // status lingers 12s after a catch
 
 fn state_path(cli: &Cli) -> PathBuf {
     cli.state.clone().unwrap_or_else(|| {
@@ -142,7 +151,15 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
             });
             println!("Task added: {name} ({daily} min/day)");
         }
-        Cmd::Start { task, plan } => run_session(&mut st, path, task, plan)?,
+        Cmd::Start { task, plan, lock } => {
+            if let Some(mode) = lock {
+                ensure!(
+                    mode == "dry" || mode == "enforce",
+                    "unknown lock mode {mode:?} — try dry or enforce"
+                );
+            }
+            run_session(&mut st, path, task, plan, lock.as_deref())?
+        }
         Cmd::Read { minutes } => {
             ensure!(*minutes > 0, "read for how many minutes?");
             st.day.read_allowance_min += minutes; // consumed by the next session
@@ -168,7 +185,13 @@ fn run(cli: &Cli, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str) -> Result<()> {
+fn run_session(
+    st: &mut YardState,
+    path: &Path,
+    task_name: &str,
+    plan_name: &str,
+    lock_mode: Option<&str>,
+) -> Result<()> {
     ensure!(
         st.task_mut(task_name).is_some(),
         "unknown task {task_name:?} — `yard add` it first"
@@ -223,12 +246,33 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
     let mut tick: u64 = 0; // drives the tip rotation
     let mut notice = String::new(); // transient status (e.g. after [R])
     let mut notice_ticks = 0u8;
+    let mut lock_show_ticks: u16 = 0; // lockdown status lingers a few ticks
     let clean_streak = st.day.clean_streak; // multiplier context for projection
     let label = plan_label(plan.name);
     // Raw keys are a real-terminal privilege; without them the honest prose
     // hints stay up and Ctrl+C remains the only way out.
     let raw_keys = if tty { keys::RawKeys::enable() } else { None };
     let keys_available = raw_keys.is_some();
+
+    // The cell's watcher (v0.5): dry run unless armed. Absent Hyprland/hyprctl
+    // means processes-only; said here up front, never discovered later.
+    let mut watcher = lock_mode.map(|m| lock::Watcher::new(m == "enforce"));
+    if let Some(mode) = lock_mode {
+        println!(
+            "Lockdown ({mode}): watching processes{}, every {}s. {}",
+            if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+                " + Hyprland window titles"
+            } else {
+                " — no Hyprland session, so window titles are off"
+            },
+            LOCK_SCAN_EVERY,
+            if mode == "enforce" {
+                "offenders get CLOSED. `--lock dry` to just watch."
+            } else {
+                "dry run: offenders are flagged, nothing is closed."
+            }
+        );
+    }
 
     while focused_secs < target_secs {
         tick += 1;
@@ -258,6 +302,35 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
                 _ => {}
             }
         }
+
+        // Lockdown (v0.5): scan the cell every few seconds, honestly.
+        let mut lock_status = String::new();
+        if let Some(w) = watcher.as_mut() {
+            if tick.is_multiple_of(LOCK_SCAN_EVERY) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let scan = w.scan(now);
+                st.day.strikes += scan.strikes_added;
+                if !scan.offenders.is_empty() {
+                    let labels: Vec<String> = scan.offenders.iter().map(|o| o.label()).collect();
+                    lock_status = if w.enforce && !scan.closed.is_empty() {
+                        format!("LOCK: closed {} — strike logged", scan.closed.join(", "))
+                    } else {
+                        format!(
+                            "LOCK dry-run: {} — flagged, nothing closed (arm: --lock enforce)",
+                            labels.join(", ")
+                        )
+                    };
+                    if !tty {
+                        println!("\r[lock] {lock_status}");
+                    }
+                    lock_show_ticks = LOCK_SHOW_TICKS;
+                }
+            }
+        }
+        lock_show_ticks = lock_show_ticks.saturating_sub(1);
 
         // A deliberate pause [P] stops the whole clock: the gate is frozen
         // (nothing accrues, nothing burns) and resumes forgiven.
@@ -291,6 +364,8 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
                 "PAUSED BY YOU — the clock is stopped, no credit accrues. [P] to resume".to_string(),
                 Some("33"),
             )
+        } else if lock_show_ticks > 0 && !lock_status.is_empty() {
+            (lock_status.clone(), Some("31"))
         } else if notice_ticks > 0 {
             (notice.clone(), Some("36"))
         } else {
@@ -396,6 +471,12 @@ fn run_session(st: &mut YardState, path: &Path, task_name: &str, plan_name: &str
     if bailed {
         println!("Emergency exit: this banks as a bail — the clean streak reset, but the work wasn't wasted.");
     }
+    if st.day.strikes > 0 {
+        println!(
+            "Strikes today: {} — the cell caught apps drifting; they cut the multiplier, see the report.",
+            st.day.strikes
+        );
+    }
     if let Some(t) = st.tasks.iter().find(|t| t.name == task_name) {
         println!("Task progress: {}/{} min today", t.done_min, t.daily_goal_min);
     }
@@ -483,6 +564,12 @@ fn print_report(st: &YardState) {
         st.day.yard_earned_min - st.day.yard_spent_min
     );
     println!("  Clean streak: {} sessions", st.day.clean_streak);
+    if st.day.strikes > 0 {
+        println!(
+            "  Strikes: {} — blocked-app catches this day (each cut the multiplier when scored)",
+            st.day.strikes
+        );
+    }
     if st.day.read_allowance_min > 0 {
         println!("  Queued reading allowance: {} min (next session)", st.day.read_allowance_min);
     }
@@ -523,5 +610,39 @@ mod tests {
         assert!(parse_duration_min("0m").is_err());
         assert!(parse_duration_min("0h0m").is_err());
         assert!(parse_duration_min("").is_err());
+    }
+
+    // --- the strike penalty and its floor (v0.5) -----------------------------
+
+    fn session(focused: u64, bailed: bool) -> Session {
+        Session {
+            task: "t".into(),
+            started_at: 0,
+            focused_min: focused,
+            idle_min: 0,
+            bailed,
+        }
+    }
+
+    #[test]
+    fn strikes_cut_the_multiplier_but_never_below_the_floor() {
+        let mut st = YardState::default();
+        st.day.strikes = 1; // ×(1 + 0 − 0.15) = ×0.85
+        st.record_session(session(60, false), 0.5);
+        assert_eq!(st.day.yard_earned_min, 26); // round(60 × 0.5 × 0.85) = round(25.5) = 26
+
+        st = YardState::default();
+        st.day.strikes = 100; // penalty clamps at 0.9 → ×0.1 floor
+        st.record_session(session(60, false), 0.5);
+        assert_eq!(st.day.yard_earned_min, 3); // 60×0.5×0.1 = 3
+    }
+
+    #[test]
+    fn a_strike_and_a_streak_partially_cancel_but_streak_is_bounded() {
+        let mut st = YardState::default();
+        st.day.clean_streak = 5; // +0.5 (capped at +1.0)
+        st.day.strikes = 2; // −0.3
+        st.record_session(session(60, false), 0.5);
+        assert_eq!(st.day.yard_earned_min, 36); // 60 × 0.5 × (1 + 0.5 − 0.3)
     }
 }

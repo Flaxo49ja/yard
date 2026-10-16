@@ -31,6 +31,8 @@ pub struct Day {
     pub clean_streak: u64,            // consecutive clean sessions
     #[serde(default)]
     pub read_allowance_min: u64,      // queued by `yard read`, one-shot
+    #[serde(default)]
+    pub strikes: u64,                 // lockdown catches (v0.5)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -62,8 +64,13 @@ impl YardState {
     }
 
     pub fn record_session(&mut self, session: Session, ratio: f64) {
-        // yard_time = focused_minutes × ratio × behavior multiplier (starter: 1.0 + streak bonus).
-        let multiplier = 1.0 + (self.day.clean_streak as f64 * 0.10);
+        // yard_time = focused_minutes × ratio × behavior multiplier.
+        // Streak bonus compounds; each strike today costs 15% (hits the floor
+        // at ×0.1 so the multiplier can never undo the work itself — the plan
+        // doc's "there is a floor" promise, applied to both directions).
+        let bonus = (self.day.clean_streak as f64 * 0.10).min(1.0);
+        let penalty = (self.day.strikes as f64 * 0.15).min(0.9);
+        let multiplier = 1.0 + bonus - penalty;
         let earned = (session.focused_min as f64 * ratio * multiplier).round() as u64;
         if !session.bailed {
             self.day.clean_streak += 1;
