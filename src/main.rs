@@ -563,7 +563,11 @@ fn print_report(st: &YardState) {
         st.day.yard_spent_min,
         st.day.yard_earned_min - st.day.yard_spent_min
     );
-    println!("  Clean streak: {} sessions", st.day.clean_streak);
+    println!(
+        "  Clean streak: {} {}",
+        st.day.clean_streak,
+        if st.day.clean_streak == 1 { "session" } else { "sessions" }
+    );
     if st.day.strikes > 0 {
         println!(
             "  Strikes: {} — blocked-app catches this day (each cut the multiplier when scored)",
@@ -584,7 +588,7 @@ fn print_report(st: &YardState) {
             .unwrap_or(0) as usize;
         let filled = pct.min(100) / 5;
         let bar = "#".repeat(filled) + &".".repeat(20 - filled);
-        println!("  {bar} {:>3}% {}/{} min", pct, t.done_min, t.daily_goal_min);
+        println!("  {bar} {:>3}% {}/{} min — {}", pct, t.done_min, t.daily_goal_min, t.name);
     }
 }
 
