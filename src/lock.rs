@@ -365,14 +365,76 @@ mod tests {
 
     // --- /proc plumbing ------------------------------------------------------------
 
+    /// Spawn a bash that prints `ready` and then BLOCKS ON STDIN. Deliberately
+    /// never execs anything after the announce — `bash -c 'echo ready; exec
+    /// sleep …'` was the CI-flake root: the handshake only proves `echo` ran,
+    /// but by the time we read /proc the exec had usually landed, so comm ate
+    /// both `bash` and `sleep` nondeterministically. Blocking on a stdin pipe
+    /// we hold open pins the image in place: comm=bash, cmdline=our body,
+    /// ppid=us — all settled, forever. Returns (child, stdin-holder); keep
+    /// the holder alive or EOF ends the child.
+    fn spawn_announced(body: &'static str) -> (std::process::Child, std::process::ChildStdin) {
+        let mut child = Command::new("bash")
+            .args(["-c", body])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning the announced child");
+        let keep = child.stdin.take().expect("piped stdin");
+        // ChildStdout is Read-only (no BufRead), so the handshake is a raw
+        // byte loop until the ready line's newline arrives.
+        let cs = child.stdout.as_mut().expect("piped stdout");
+        let mut buf = [0u8; 1];
+        loop {
+            let n = std::io::Read::read(cs, &mut buf)
+                .expect("reading the child's ready byte");
+            assert!(n > 0, "child closed stdout before announcing");
+            if buf[0] == b'\n' {
+                break;
+            }
+        }
+        (child, keep)
+    }
+
+    /// Same fixture, with a spoofed argv[0] (`CommandExt::arg0` — the image
+    /// never changes, so the name is settled too: users see `mpv`, comm is
+    /// still bash — exactly what the watcher's argv0-override must expose).
+    fn spawn_announced_spoofed(
+        argv0: &'static str,
+        body: &'static str,
+    ) -> (std::process::Child, std::process::ChildStdin) {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("bash");
+        cmd.arg0(argv0);
+        let mut child = cmd
+            .args(["-c", body])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawning the spoofed child");
+        let keep = child.stdin.take().expect("piped stdin");
+        let cs = child.stdout.as_mut().expect("piped stdout");
+        let mut buf = [0u8; 1];
+        loop {
+            let n = std::io::Read::read(cs, &mut buf)
+                .expect("reading the child's ready byte");
+            assert!(n > 0, "child closed stdout before announcing");
+            if buf[0] == b'\n' {
+                break;
+            }
+        }
+        (child, keep)
+    }
+
     #[test]
     fn proc_metadata_of_a_child_is_sane() {
-        let mut child = Command::new("sleep").arg("3").spawn().unwrap();
+        // The announce-and-block fixture never re-execs, so the image is
+        // settled before the first /proc read: comm=bash, body in cmdline.
+        let (mut child, _stdin) = spawn_announced("echo ready; read -r line");
         let pid = child.id() as i32;
-        let comm = read_comm(pid).unwrap();
-        assert_eq!(comm, "sleep");
+        assert_eq!(read_comm(pid).unwrap(), "bash");
         let cmd = read_cmdline(pid).unwrap();
-        assert!(cmd.contains("sleep"), "cmdline was: {cmd}");
+        assert!(cmd.contains("read"), "cmdline was: {cmd}");
         assert_eq!(ppid_of(pid).unwrap(), std::process::id() as i32);
         let _ = child.kill();
         assert!(child.wait().is_ok()); // reap: no zombie
@@ -408,19 +470,18 @@ mod tests {
 
     #[test]
     fn enforce_mode_closes_a_spoofed_offender_and_dry_run_does_not() {
-        // `exec -a` makes argv[0] = mpv: a real /proc reader sees an offender.
-        let mut spoofed = Command::new("bash")
-            .args(["-c", "exec -a mpv sleep 60"])
-            .spawn()
-            .unwrap();
+        // arg0-spoofed, announce-and-block fixture: a settled argv of
+        // [mpv, -c, …] with comm still bash — the exact shape the v0.5
+        // argv0-name override exists for. Nothing races the scan.
+        let (mut spoofed, _stdin) = spawn_announced_spoofed("mpv", "echo ready; read -r line");
         let pid = spoofed.id() as i32;
 
-        // dry run: flagged as an offender by name, still alive afterwards
+        // dry run: flagged (name + keyword), alive after
         let mut dry = Watcher::new(false);
         let out = dry.scan(0);
         assert!(
-            out.offenders.iter().any(|o| o.pid == pid && o.name == "mpv"),
-            "spoofed mpv must be flagged; got {:?}",
+            out.offenders.iter().any(|o| o.pid == pid && o.matched == "mpv" && o.name == "mpv"),
+            "spoofed mpv must be flagged by name and keyword; got {:?}",
             out.offenders
         );
         assert!(out.closed.is_empty(), "dry run closes nothing");
@@ -429,21 +490,19 @@ mod tests {
             "dry run must leave the process alive"
         );
 
-        // enforce: the same scan closes it (fresh process so no pid reuse)
-        let mut spoofed2 = Command::new("bash")
-            .args(["-c", "exec -a mpv sleep 60"])
-            .spawn()
-            .unwrap();
+        // enforce: a fresh fixture gets closed by label `mpv (pid N)`
+        let (mut spoofed2, _stdin2) = spawn_announced_spoofed("mpv", "echo ready; read -r line");
         let pid2 = spoofed2.id() as i32;
         let mut armed = Watcher::new(true);
         let out2 = armed.scan(0);
         assert!(
-            out2.closed.iter().any(|l| l.contains(&pid2.to_string()) && l.contains("mpv")),
+            out2.closed.iter().any(|l| l.contains(&pid2.to_string()) && l.starts_with("mpv")),
             "enforce must close the spoofed offender; got {:?}",
             out2.closed
         );
         let reaped = spoofed2.wait(); // reaped after TERM
         assert!(reaped.is_ok(), "closed child should reap cleanly");
+        // the dry-phase fixture was also fair game for the armed scan; reap it
         let _ = spoofed.kill();
         assert!(spoofed.wait().is_ok()); // reap: no zombie
     }
